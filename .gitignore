@@ -1,0 +1,6 @@
+/kernel_meta*
+__pycache__
+/edu_fineweb10B
+/hellaswag
+nohup.out*
+*.pt

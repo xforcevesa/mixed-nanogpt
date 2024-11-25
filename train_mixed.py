@@ -8,6 +8,7 @@ import torch_npu
 import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
+import types
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -77,16 +78,26 @@ class GPTConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
 
+from rwkv_v7 import Block as RWKVBlock
+
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.config = config
 
+        args = types.SimpleNamespace()
+
+        args.head_size_a = 64 # don't change
+        args.head_size_divisor = 8 # don't change
+        args.n_embd = config.n_embd
+        args.dim_att = config.n_embd
+        args.n_layer = config.n_layer
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) if i % 8 == 0 else RWKVBlock(args, i) for i in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -117,9 +128,13 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         x = tok_emb + pos_emb
+        v0 = torch.empty_like(x)
         # forward the blocks of the transformer
         for block in self.transformer.h:
-            x = block(x)
+            if isinstance(block, RWKVBlock):
+                x, v0 = block(x, v0)
+            else:
+                x = block(x)
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)

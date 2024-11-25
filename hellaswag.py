@@ -111,7 +111,7 @@ def render_example(example):
 
 def iterate_examples(split):
     # there are 10,042 examples in total in val
-    download(split)
+    # download(split)
     with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
         for line in f:
             example = json.loads(line)
