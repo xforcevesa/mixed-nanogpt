@@ -348,6 +348,9 @@ min_lr = max_lr * 0.1
 warmup_steps = 715
 #max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 max_steps = 25431 # 25,431 steps is ~1 epoch, if data is 10B tokens and batch size 0.39M tokens
+if master_process:
+    print(f"max_lr: {max_lr}, min_lr: {min_lr}, warmup_steps: {warmup_steps}, max_steps: {max_steps}")
+    print(f"total tokens will be trained: {total_batch_size * max_steps / 1e9:.2f}B")
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -394,7 +397,7 @@ for step in range(max_steps):
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                f.write(f"{step} {step*total_batch_size} val {val_loss_accum.item():.4f}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
@@ -439,7 +442,7 @@ for step in range(max_steps):
         if master_process:
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             with open(log_file, "a") as f:
-                f.write(f"{step} hella {acc_norm:.4f}\n")
+                f.write(f"{step} {step*total_batch_size} hella {acc_norm:.4f}\n")
 
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
@@ -514,7 +517,7 @@ for step in range(max_steps):
         loss_accum = loss_accum.item() / ddp_world_size
         print(f"step {step:5d} | loss: {loss_accum:.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum:.6f}\n")
+            f.write(f"{step} {step*total_batch_size} train {loss_accum:.6f}\n")
 
 if ddp:
     destroy_process_group()
