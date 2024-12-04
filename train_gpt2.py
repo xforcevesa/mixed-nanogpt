@@ -395,9 +395,10 @@ for step in range(max_steps):
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.SUM)
         if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}")
+            val_loss_accum = val_loss_accum.item() / ddp_world_size
+            print(f"validation loss: {val_loss_accum:.4f}")
             with open(log_file, "a") as f:
-                f.write(f"{step} {step*total_batch_size} val {val_loss_accum.item():.4f}\n")
+                f.write(f"{step} {step*total_batch_size} val {val_loss_accum:.4f}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
@@ -405,7 +406,7 @@ for step in range(max_steps):
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': val_loss_accum
                 }
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
