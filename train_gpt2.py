@@ -318,7 +318,7 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 131072*3# 2**19, ~0.5M, in number of tokens
+total_batch_size = 131072*3# ~0.39M, in number of tokens; old is 524288 = 2**19
 B = 4*3 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
@@ -346,7 +346,8 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 max_lr = 2e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+#max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 25431 # 25,431 steps is ~1 epoch, if data is 10B tokens and batch size 0.39M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -366,7 +367,7 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt")
+log_file = os.path.join(log_dir, f"gpt2.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
@@ -510,9 +511,10 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        loss_accum = loss_accum.item() / ddp_world_size
+        print(f"step {step:5d} | loss: {loss_accum:.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+            f.write(f"{step} train {loss_accum:.6f}\n")
 
 if ddp:
     destroy_process_group()
