@@ -24,28 +24,63 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.n_cluster = config.n_cluster
+        self.group_size = config.group_size
         # 
         self.soft_assign = nn.Linear(config.n_embd, config.n_cluster, bias=False)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        device = x.device
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
 
-        # dynamic assignment and clustering (先single head)
-        cluster_assign = self.soft_assign(k) # (B, T, n_cluster) # 可以试试x, 根据不同的值来计算聚类分数，含义是不同的
+        # step 1: dynamic assignment and clustering
+        # 可以试试x, 根据不同的值来计算聚类分数，含义是不同的
+        cluster_assign = self.soft_assign(k).permute(0, 2, 1) # (B, n_cluster, T)
+        # Calculate the number of tokens per cluster
+        num_tokens_per_cluster = T // self.n_cluster
+        assert T % self.n_cluster == 0, "T must be divisible by n_cluster in training mode"
+        # Create a mask tensor filled with zeros, shape (B, n_cluster, T)
+        attn_mask = torch.zeros((B, self.n_cluster, T), dtype=torch.bool, device=device)
+        # Generate token indices
+        token_indices = torch.arange(T, device=device).unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, T)
+        # Compute the start and end indices for each cluster
+        start_indices = torch.arange(0, T, num_tokens_per_cluster, device=device).unsqueeze(1)  # Shape: (n_cluster, 1)
+        end_indices = start_indices + num_tokens_per_cluster  # Shape: (n_cluster, 1)
+        # Use broadcasting to generate the mask
+        attn_mask[:, :, :] = (token_indices >= start_indices) & (token_indices < end_indices)
+        # Apply the mask to the cluster assignment
+        cluster_assign.masked_fill_(attn_mask.logical_not(), float("-inf"))
         # softmax over assignment:
-        cluster_assign = F.softmax(cluster_assign, dim=-1).permute(0, 2, 1) # (B, n_cluster, T)
+        cluster_assign = F.softmax(cluster_assign, dim=-1) # (B, n_cluster, T)
         # apply the assignment to the keys and values, get dynamic centers of k and v
-        k = cluster_assign @ k # (B, n_cluster, T) @ (B, T, D) -> (B, n_cluster, D)
-        v = cluster_assign @ v # (B, n_cluster, T) @ (B, T, D) -> (B, n_cluster, D)
+        ck = cluster_assign @ k # (B, n_cluster, T) @ (B, T, C) -> (B, n_cluster, C)
+        cv = cluster_assign @ v # (B, n_cluster, T) @ (B, T, C) -> (B, n_cluster, C)
 
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        k = k.view(B, self.n_cluster, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, n_cluster, hs)
-        v = v.view(B, self.n_cluster, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, n_cluster, hs)
+        # step 2: group seqence into groups
+        n_group = T // self.group_size
+        assert T % self.group_size == 0, "T must be divisible by group_size in training mode"
+        # reshape q, k, v to (B, n_group, group_size, C)
+        q = q.view(B, n_group, self.group_size, C) # (B, n_group, group_size, C)
+        k = k.view(B, n_group, self.group_size, C)
+        v = v.view(B, n_group, self.group_size, C)
+        # repeat ck, cv to (B, n_group, n_cluster, C)
+        ck = ck.unsqueeze(1).repeat_interleave(n_group, dim=1) # (B, n_group, n_cluster, C)
+        cv = cv.unsqueeze(1).repeat_interleave(n_group, dim=1) # (B, n_group, n_cluster, C)
+        # concatenate k and ck, v and cv
+        k = torch.cat([ck, k], dim=2) # (B, n_group, n_cluster+group_size, C)
+        v = torch.cat([cv, v], dim=2) # (B, n_group, n_cluster+group_size, C)
+
+        window_size = k.size(2) # n_cluster + group_size
+        # step 3: create causal mask
+        causal_group_mask = torch.ones(self.group_size, self.group_size, dtype=torch.bool).tril(diagonal=0) # (gs, gs)
+        # step 4: calculate attention
+        q = q.view(B*n_group, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B*n_group, nh, gs, hs)
+        k = k.view(B*n_group, window_size, self.n_head, C // self.n_head).transpose(1, 2) # (B*n_group, nh, ws, hs)
+        v = v.view(B*n_group, window_size, self.n_head, C // self.n_head).transpose(1, 2) # (B*n_group, nh, ws, hs)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
