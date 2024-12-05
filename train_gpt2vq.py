@@ -23,6 +23,7 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.n_cluster = config.n_cluster
         # 
         self.soft_assign = nn.Linear(config.n_embd, config.n_cluster, bias=False)
 
@@ -43,8 +44,8 @@ class CausalSelfAttention(nn.Module):
         v = cluster_assign @ v # (B, n_cluster, T) @ (B, T, D) -> (B, n_cluster, D)
 
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, n_cluster, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, n_cluster, hs)
+        k = k.view(B, self.n_cluster, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, n_cluster, hs)
+        v = v.view(B, self.n_cluster, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, n_cluster, hs)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
@@ -87,6 +88,7 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
+    n_cluster: int = 256 # number of clusters
 
 class GPT(nn.Module):
 
@@ -329,7 +331,7 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 131072*3# 2**19, ~0.5M, in number of tokens
+total_batch_size = 131072*3# ~0.39M, in number of tokens; old is 524288 = 2**19
 B = 4*3 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
@@ -357,7 +359,11 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 max_lr = 2e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+#max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 25431 # 25,431 steps is ~1 epoch, if data is 10B tokens and batch size 0.39M tokens
+if master_process:
+    print(f"max_lr: {max_lr}, min_lr: {min_lr}, warmup_steps: {warmup_steps}, max_steps: {max_steps}")
+    print(f"total tokens will be trained: {total_batch_size * max_steps / 1e9:.2f}B")
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -375,7 +381,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
-log_dir = "log"
+log_dir = "log/gpt2vq"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
@@ -402,9 +408,10 @@ for step in range(max_steps):
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.SUM)
         if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}")
+            val_loss_accum = val_loss_accum.item() / ddp_world_size
+            print(f"validation loss: {val_loss_accum:.4f}")
             with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                f.write(f"{step} {step*total_batch_size} val {val_loss_accum:.4f}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
@@ -412,7 +419,7 @@ for step in range(max_steps):
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': val_loss_accum
                 }
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
@@ -449,7 +456,7 @@ for step in range(max_steps):
         if master_process:
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             with open(log_file, "a") as f:
-                f.write(f"{step} hella {acc_norm:.4f}\n")
+                f.write(f"{step} {step*total_batch_size} hella {acc_norm:.4f}\n")
 
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
@@ -521,9 +528,10 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        loss_accum = loss_accum.item() / ddp_world_size
+        print(f"step {step:5d} | loss: {loss_accum:.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+            f.write(f"{step} {step*total_batch_size} train {loss_accum:.6f}\n")
 
 if ddp:
     destroy_process_group()

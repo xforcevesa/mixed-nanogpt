@@ -368,9 +368,9 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
-log_dir = "log"
+log_dir = "log/gpt2"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"gpt2.txt")
+log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
