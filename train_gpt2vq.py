@@ -30,6 +30,26 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        return self.short_forward(x) if T <= self.group_size else self.long_forward(x)
+
+    def short_forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
+        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # output projection
+        y = self.c_proj(y)
+        return y
+
+    def long_forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         device = x.device
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
@@ -42,7 +62,7 @@ class CausalSelfAttention(nn.Module):
         cluster_assign = self.soft_assign(k).permute(0, 2, 1) # (B, n_cluster, T)
         # Calculate the number of tokens per cluster
         num_tokens_per_cluster = T // self.n_cluster
-        assert T % self.n_cluster == 0, "T must be divisible by n_cluster in training mode"
+        assert T % self.n_cluster == 0, f"sequence with {T} tokens cannot be divided into {self.n_cluster} clusters"
         # Create a mask tensor filled with zeros, shape (B, n_cluster, T)
         attn_mask = torch.zeros((B, self.n_cluster, T), dtype=torch.bool, device=device)
         # Generate token indices
@@ -67,22 +87,24 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, n_group, self.group_size, C) # (B, n_group, group_size, C)
         k = k.view(B, n_group, self.group_size, C)
         v = v.view(B, n_group, self.group_size, C)
-        # repeat ck, cv to (B, n_group, n_cluster, C)
-        ck = ck.unsqueeze(1).repeat_interleave(n_group, dim=1) # (B, n_group, n_cluster, C)
-        cv = cv.unsqueeze(1).repeat_interleave(n_group, dim=1) # (B, n_group, n_cluster, C)
-        # concatenate k and ck, v and cv
-        k = torch.cat([ck, k], dim=2) # (B, n_group, n_cluster+group_size, C)
-        v = torch.cat([cv, v], dim=2) # (B, n_group, n_cluster+group_size, C)
-
-        window_size = k.size(2) # n_cluster + group_size
-        # step 3: create causal mask
-        causal_group_mask = torch.ones(self.group_size, self.group_size, dtype=torch.bool).tril(diagonal=0) # (gs, gs)
-        # step 4: calculate attention
-        q = q.view(B*n_group, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B*n_group, nh, gs, hs)
-        k = k.view(B*n_group, window_size, self.n_head, C // self.n_head).transpose(1, 2) # (B*n_group, nh, ws, hs)
-        v = v.view(B*n_group, window_size, self.n_head, C // self.n_head).transpose(1, 2) # (B*n_group, nh, ws, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # step 3: apply causal attention to each group
+        y = torch.zeros_like(q) # (B, n_group, group_size, C)
+        for i in range(n_group):
+            qi = q[:, i, :, :].view(B, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs, hs)
+            ki = torch.cat([ck, k[:, i, :, :]], dim=1).view(B, self.group_size+self.n_cluster, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs+nc, hs)
+            vi = torch.cat([cv, v[:, i, :, :]], dim=1).view(B, self.group_size+self.n_cluster, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs+nc, hs)
+            # create causal mask
+            causal_group_mask = torch.ones(self.group_size, self.group_size, dtype=torch.bool, device=device).tril(diagonal=0) # (gs, gs)
+            causal_cluster_mask = torch.zeros(self.group_size, self.n_cluster, dtype=torch.bool, device=device) # (gs, nc)
+            cluster_block_size = self.group_size // num_tokens_per_cluster # how many clusters in a group
+            causal_cluster_mask[:, :i * cluster_block_size] = True
+            causal_mask = torch.cat([causal_cluster_mask, causal_group_mask], dim=1) # (group_size, n_cluster+group_size)
+            # calculate attention
+            yi = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=causal_mask) # flash attention
+            yi = yi.transpose(1, 2).contiguous().view(B, self.group_size, C) # re-assemble all head outputs side by side
+            y[:, i, :, :] = yi
+        # step 4: recompose groups into sequence
+        y = y.view(B, T, C) # (B, T, C)
         # output projection
         y = self.c_proj(y)
         return y
@@ -124,6 +146,7 @@ class GPTConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
     n_cluster: int = 256 # number of clusters
+    group_size: int = 256 # group size
 
 class GPT(nn.Module):
 
