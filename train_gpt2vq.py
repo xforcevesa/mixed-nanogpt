@@ -30,7 +30,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        return self.short_forward(x) if T <= self.group_size else self.long_forward(x)
+        return self.short_forward(x) if T <= self.group_size else self.long_forward_new(x)
 
     def short_forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -161,15 +161,17 @@ class CausalSelfAttention(nn.Module):
         ki = torch.cat([cki, k], dim=2).view(B, n_group, self.group_size+self.n_cluster, self.n_head, C // self.n_head).transpose(2, 3) # (B, ng, nh, gs+nc, hs)
         vi = torch.cat([cvi, k], dim=2).view(B, n_group, self.group_size+self.n_cluster, self.n_head, C // self.n_head).transpose(2, 3) # (B, ng, nh, gs+nc, hs)
 
-        causal_group_mask = torch.ones(self.group_size, self.group_size, dtype=torch.bool, device=device).tril(diagonal=0) # (gs, gs)
-        causal_cluster_mask = torch.zeros(self.group_size, self.n_cluster, dtype=torch.bool, device=device) # (gs, nc)
+        causal_group_mask = torch.ones(B, n_group, self.n_head, self.group_size, self.group_size, dtype=torch.bool, device=device).tril(diagonal=0) # (B, nh, ng, gs, gs)
+        causal_cluster_mask = torch.zeros(B, n_group, self.n_head, self.group_size, self.n_cluster, dtype=torch.bool, device=device) # (B, nh, ng, gs, nc)
         cluster_block_size = self.group_size // num_tokens_per_cluster # how many clusters in a group
-        causal_cluster_mask[:, :, :i * cluster_block_size] = True
-        causal_mask = torch.cat([causal_cluster_mask, causal_group_mask], dim=1) # (group_size, n_cluster+group_size)
+        for i in range(n_group):
+            causal_cluster_mask[:, i, :, :, :i * cluster_block_size] = True
+        causal_mask = torch.cat([causal_cluster_mask, causal_group_mask], dim=-1) # (B, n_group, n_head, group_size, n_cluster+group_size)
+        causal_mask = causal_mask.view(B*n_group, causal_mask.shape[-3], causal_mask.shape[-2], causal_mask.shape[-1])
         # calculate attention
-        qi = qi.view(B*n_group, self.n_head, self.group_size, C // self.n_head) # (B*ng, nh, gs, hs)
-        ki = ki.view(B*n_group, self.n_head, self.group_size+self.n_cluster, C // self.n_head) # (B*ng, nh, gs+nc, hs)
-        vi = vi.view(B*n_group, self.n_head, self.group_size+self.n_cluster, C // self.n_head) # (B*ng, nh, gs+nc, hs)
+        qi = qi.view(B*n_group, qi.shape[-3], qi.shape[-2], qi.shape[-1]) # (B*ng, nh, gs, hs)
+        ki = ki.view(B*n_group, ki.shape[-3], ki.shape[-2], ki.shape[-1]) # (B*ng, nh, gs+nc, hs)
+        vi = vi.view(B*n_group, vi.shape[-3], vi.shape[-2], vi.shape[-1]) # (B*ng, nh, gs+nc, hs)
         yi = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=causal_mask) # (B*ng, nh, gs, hs)
         yi = yi.transpose(1, 2).contiguous() # (B*ng, gs, nh, hs)
         y = yi.view(B*n_group, self.group_size, C) # re-assemble all head outputs side by side
