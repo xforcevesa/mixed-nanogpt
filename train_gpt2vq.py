@@ -108,6 +108,80 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.c_proj(y)
         return y
+    
+    def long_forward_new(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        device = x.device
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
+        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+
+        # step 1: dynamic assignment and clustering
+        # 可以试试x, 根据不同的值来计算聚类分数，含义是不同的
+        cluster_assign = self.soft_assign(k).permute(0, 2, 1) # (B, n_cluster, T)
+        # Calculate the number of tokens per cluster
+        num_tokens_per_cluster = T // self.n_cluster
+        assert T % self.n_cluster == 0, f"sequence with {T} tokens cannot be divided into {self.n_cluster} clusters"
+        # Create a mask tensor filled with zeros, shape (B, n_cluster, T)
+        attn_mask = torch.zeros((B, self.n_cluster, T), dtype=torch.bool, device=device)
+        # Generate token indices
+        token_indices = torch.arange(T, device=device).unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, T)
+        # Compute the start and end indices for each cluster
+        start_indices = torch.arange(0, T, num_tokens_per_cluster, device=device).unsqueeze(1)  # Shape: (n_cluster, 1)
+        end_indices = start_indices + num_tokens_per_cluster  # Shape: (n_cluster, 1)
+        # Use broadcasting to generate the mask
+        attn_mask[:, :, :] = (token_indices >= start_indices) & (token_indices < end_indices)
+        # Apply the mask to the cluster assignment
+        cluster_assign.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        # softmax over assignment:
+        cluster_assign = F.softmax(cluster_assign, dim=-1) # (B, n_cluster, T)
+        # apply the assignment to the keys and values, get dynamic centers of k and v
+        ck = cluster_assign @ k # (B, n_cluster, T) @ (B, T, C) -> (B, n_cluster, C)
+        cv = cluster_assign @ v # (B, n_cluster, T) @ (B, T, C) -> (B, n_cluster, C)
+
+        # step 2: group seqence into groups
+        n_group = T // self.group_size
+        assert T % self.group_size == 0, "T must be divisible by group_size in training mode"
+        # reshape q, k, v to (B, n_group, group_size, C)
+        q = q.view(B, n_group, self.group_size, C) # (B, n_group, group_size, C)
+        k = k.view(B, n_group, self.group_size, C)
+        v = v.view(B, n_group, self.group_size, C)
+        # step 3: apply causal attention to each group
+        # y = torch.zeros_like(q) # (B, n_group, group_size, C)
+        
+        # ==== The above is copied from the original long_forward method ====
+        # ==== The following is the optimized version of the for loop ====
+        cki = ck.unsqueeze(1) # (B, n_cluster, C) -> (B, 1, n_cluster, C)
+        cki = cki.repeat(1, n_group, 1, 1) # (B, 1, n_cluster, C) -> (B, n_group, n_cluster, C)
+        cvi = cv.unsqueeze(1) # (B, n_cluster, C) -> (B, 1, n_cluster, C)
+        cvi = cvi.repeat(1, n_group, 1, 1) # (B, 1, n_cluster, C) -> (B, n_group, n_cluster, C)
+        qi = q.view(B, n_group, self.group_size, self.n_head, C // self.n_head).transpose(2, 3) # (B, ng, nh, gs, hs)
+        ki = torch.cat([cki, k], dim=2).view(B, n_group, self.group_size+self.n_cluster, self.n_head, C // self.n_head).transpose(2, 3) # (B, ng, nh, gs+nc, hs)
+        vi = torch.cat([cvi, k], dim=2).view(B, n_group, self.group_size+self.n_cluster, self.n_head, C // self.n_head).transpose(2, 3) # (B, ng, nh, gs+nc, hs)
+
+        causal_group_mask = torch.ones(self.group_size, self.group_size, dtype=torch.bool, device=device).tril(diagonal=0) # (gs, gs)
+        causal_cluster_mask = torch.zeros(self.group_size, self.n_cluster, dtype=torch.bool, device=device) # (gs, nc)
+        cluster_block_size = self.group_size // num_tokens_per_cluster # how many clusters in a group
+        causal_cluster_mask[:, :, :i * cluster_block_size] = True
+        causal_mask = torch.cat([causal_cluster_mask, causal_group_mask], dim=1) # (group_size, n_cluster+group_size)
+        # calculate attention
+        qi = qi.view(B*n_group, self.n_head, self.group_size, C // self.n_head) # (B*ng, nh, gs, hs)
+        ki = ki.view(B*n_group, self.n_head, self.group_size+self.n_cluster, C // self.n_head) # (B*ng, nh, gs+nc, hs)
+        vi = vi.view(B*n_group, self.n_head, self.group_size+self.n_cluster, C // self.n_head) # (B*ng, nh, gs+nc, hs)
+        yi = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=causal_mask) # (B*ng, nh, gs, hs)
+        yi = yi.transpose(1, 2).contiguous() # (B*ng, gs, nh, hs)
+        y = yi.view(B*n_group, self.group_size, C) # re-assemble all head outputs side by side
+        y = y.view(B, n_group, self.group_size, C)
+        
+        # ==== The above is the optimized version of the for loop ====
+        # ==== The following is copied from the original long_forward method ====
+        # step 4: recompose groups into sequence
+        y = y.view(B, T, C) # (B, T, C)
+        # output projection
+        y = self.c_proj(y)
+        return y
 
 class MLP(nn.Module):
 

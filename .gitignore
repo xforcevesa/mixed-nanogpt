@@ -4,3 +4,4 @@ __pycache__
 /hellaswag
 nohup.out*
 *.pt
+.ipynb_checkpoints
