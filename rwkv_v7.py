@@ -17,8 +17,6 @@ DTYPE = torch.bfloat16
 
 HEAD_SIZE = 64
 
-USE_CUDA_KERNEL = True # False => UNOPTIMIZED, VERY SLOW
-
 ########################################################################################################
 # CUDA Kernel
 ########################################################################################################
@@ -37,14 +35,13 @@ def RWKV7_OP(r, w, k, v, a, b):
     state = torch.zeros((B, H, N, N), device=r.device, dtype=torch.float)
 
     for t in range(T):
-        kk = k[:, t, :]
-        rr = r[:, t, :]
-        vv = v[:, t, :]
-        aa = a[:, t, :]
-        bb = b[:, t, :]
-        sab = torch.einsum('bhik,bhk,bhj->bhij', state, aa, bb)
-        state = state * w[: , t, :, None, :] + sab + torch.einsum('bhj,bhi->bhij', kk, vv)
-        out[:, t, :] = torch.einsum('bhj,bhij->bhi', rr, state)
+        kk = k[:, t, :].view(B, H, 1, N)
+        rr = r[:, t, :].view(B, H, N, 1)
+        vv = v[:, t, :].view(B, H, N, 1)
+        aa = a[:, t, :].view(B, H, N, 1)
+        bb = b[:, t, :].view(B, H, 1, N)
+        state = state * w[: , t, :, None, :] + state @ aa @ bb + vv @ kk
+        out[:, t, :] = (state @ rr).view(B, H, N)
     return out.view(B, T, C).to(dtype=DTYPE)
 
 ########################################################################################################
@@ -171,28 +168,21 @@ class Block(nn.Module):
         self.args = args
         self.layer_id = layer_id
 
+        if self.layer_id == 0:
+            self.ln0 = nn.LayerNorm(args.n_embd) # only used in block 0, should be fused with emb
         self.ln1 = nn.LayerNorm(args.n_embd)
         self.ln2 = nn.LayerNorm(args.n_embd)
-
-        if self.layer_id == 0:
-            self.ln0 = nn.LayerNorm(args.n_embd)
 
         self.att = RWKV_Tmix_x070(args, layer_id)
         self.ffn = RWKV_CMix_x070(args, layer_id)
         
-    def forward(self, x, v0):
+    def forward(self, x, v_first):
 
         if self.layer_id == 0:
             x = self.ln0(x)
 
-        xx, v0 = self.att(self.ln1(x), v0)
+        xx, v_first = self.att(self.ln1(x), v_first)
         x = x + xx
         x = x + self.ffn(self.ln2(x))
 
-        # if RESCALE_LAYER > 0:
-        #     if (self.layer_id+1) % RESCALE_LAYER == 0:
-        #         x = x / 2
-        # if self.layer_id == args.n_layer-1:
-        #     print(torch.min(x).item(), torch.max(x).item())
-
-        return x, v0
+        return x, v_first
