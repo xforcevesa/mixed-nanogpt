@@ -5,11 +5,10 @@ import types
 import inspect
 from dataclasses import dataclass
 import torch
-import torch_npu
 import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
-from rwkv_v7 import Block as RWKVBlock
+from rwkv_v7_fp32 import Block as RWKVBlock
 
 @dataclass
 class GPTConfig:
@@ -18,8 +17,7 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
-    n_cluster: int = 256 # number of clusters
-    group_size: int = 256 # group size
+    chunk_len: int = 16 # don't change
 
 class GPT(nn.Module):
 
@@ -33,11 +31,11 @@ class GPT(nn.Module):
         args.head_size_divisor = 8 # don't change
         args.n_embd = config.n_embd
         args.dim_att = config.n_embd
+        args.dim_ffn = config.n_embd * 4
         args.n_layer = config.n_layer
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([RWKVBlock(args, i) for i in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
@@ -64,9 +62,13 @@ class GPT(nn.Module):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        if T % self.config.chunk_len != 0:
+            # left padding by add eos token at the beginning, 50256 is the eos token of gpt2 tokenizer
+            num_tokens_to_pad = self.config.chunk_len - T % self.config.chunk_len
+            eos_idx = torch.full((B, num_tokens_to_pad), 50256, dtype=torch.long, device=idx.device)
+            idx = torch.cat((eos_idx, idx), dim=-1)
         # forward the token embeddings, no positional encodings
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
-        x = tok_emb
+        x = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         # forward the blocks of the transformer
         v_first = torch.empty_like(x)
         for block in self.transformer.h:
@@ -74,6 +76,9 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
+        # if left padding was done, remove the leftmost elements
+        if T % self.config.chunk_len != 0:
+            logits = logits[:, num_tokens_to_pad:]
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -194,12 +199,12 @@ ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     # assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend='hccl')
+    init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'npu:{ddp_local_rank}'
-    torch.npu.set_device(device)
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 else:
     # vanilla, non-DDP run
@@ -208,11 +213,11 @@ else:
     ddp_world_size = 1
     master_process = True
     # attempt to autodetect device
-    device = "npu"
+    device = "cuda"
     print(f"using device: {device}")
 
 # added after video, pytorch can be serious about it's device vs. device_type distinction
-device_type = "npu"
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -221,7 +226,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 131072*3# ~0.39M, in number of tokens; old is 524288 = 2**19
-B = 4*3 # micro batch size
+B = 4*2 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -290,7 +295,7 @@ for step in range(max_steps):
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.float32):
                     logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
@@ -328,7 +333,7 @@ for step in range(max_steps):
             mask = mask.to(device)
             # get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.float32):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
@@ -361,7 +366,7 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.float32):
                     logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
@@ -393,7 +398,7 @@ for step in range(max_steps):
         # added after video, this field is also used by the forward pass.
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.float32):
             logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().

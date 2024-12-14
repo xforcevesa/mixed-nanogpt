@@ -78,7 +78,7 @@ class GPTConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
 
-from rwkv_v7 import Block as RWKVBlock
+from rwkv_v7_fp32 import Block as RWKVBlock
 
 class GPT(nn.Module):
 
