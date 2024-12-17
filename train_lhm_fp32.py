@@ -198,7 +198,7 @@ class GPT(nn.Module):
             num_tokens_to_pad = self.config.chunk_len - T % self.config.chunk_len
             eos_idx = torch.full((B, num_tokens_to_pad), 50256, dtype=torch.long, device=idx.device)
             idx = torch.cat((eos_idx, idx), dim=-1)
-        # forward the token embeddings, no positional encodings
+        # forward the token embeddings, no positional encodings !!!
         x = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         # forward the blocks of the transformer
         v_first = torch.empty_like(x)
