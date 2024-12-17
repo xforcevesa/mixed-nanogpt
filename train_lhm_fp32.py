@@ -200,10 +200,18 @@ class GPT(nn.Module):
             eos_idx = torch.full((B, num_tokens_to_pad), 50256, dtype=torch.long, device=idx.device)
             idx = torch.cat((eos_idx, idx), dim=-1)
         # forward the token and posisition embeddings
-        pos = torch.arange(0, idx.size(1), dtype=torch.long, device=idx.device) # shape (T)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
-        x = tok_emb + pos_emb
+        if idx.size(1) <= self.config.group_size:
+            pos = torch.arange(0, idx.size(1), dtype=torch.long, device=idx.device)
+            pos_emb = self.transformer.wpe(pos)
+            tok_emb = self.transformer.wte(idx)
+            x = tok_emb + pos_emb
+        else:
+            pos = torch.arange(0, self.config.group_size, dtype=torch.long, device=idx.device)
+            pos_emb = self.transformer.wpe(pos)
+            tok_emb = self.transformer.wte(idx)
+            tok_emb = tok_emb.view(B, -1, self.config.group_size, self.config.n_embd)
+            x = tok_emb + pos_emb
+            x = x.view(B, -1, self.config.n_embd)
         # forward the blocks of the transformer
         v_first = torch.empty_like(x)
         for block in self.transformer.h:
