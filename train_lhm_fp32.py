@@ -167,7 +167,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            #wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) if i % config.interval == (config.interval-1) else RWKVBlock(args, i) for i in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
@@ -200,10 +200,10 @@ class GPT(nn.Module):
             eos_idx = torch.full((B, num_tokens_to_pad), 50256, dtype=torch.long, device=idx.device)
             idx = torch.cat((eos_idx, idx), dim=-1)
         # forward the token and posisition embeddings
-        pos = torch.arange(0, idx.size(1), dtype=torch.long, device=idx.device) # shape (T)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        #pos = torch.arange(0, idx.size(1), dtype=torch.long, device=idx.device) # shape (T)
+        #pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
-        x = tok_emb + pos_emb
+        x = tok_emb #+ pos_emb
         # forward the blocks of the transformer
         v_first = torch.empty_like(x)
         for block in self.transformer.h:
@@ -416,7 +416,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
-log_dir = "log/lmh_L12D768_CTX1024_C256G256_INTV4_NewPOS"
+log_dir = "log/lmh_L12D768_CTX1024_C256G256_INTV4_noPOS"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
