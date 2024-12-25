@@ -58,16 +58,16 @@ class CausalSelfAttention(nn.Module):
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
+        # apply rotary position embeddings
+        sinusoidal_pos = self.get_sinusoidal_embeddings(T, self.n_embd).to(x.device)
+        q = self.apply_rotary_position_embeddings(sinusoidal_pos, q)
+        k = self.apply_rotary_position_embeddings(sinusoidal_pos, k)
+        # reshape q, k, v to (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # apply rotary position embeddings
-        sinusoidal_pos = self.get_sinusoidal_embeddings(T, self.n_embd // self.n_head).to(x.device)
-        q_rot = self.apply_rotary_position_embeddings(sinusoidal_pos, q)
-        k_rot = self.apply_rotary_position_embeddings(sinusoidal_pos, k)
-
-        y = F.scaled_dot_product_attention(q_rot, k_rot, v, is_causal=True) # flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -115,21 +115,25 @@ class CausalSelfAttention(nn.Module):
         num_clusters_per_group = self.group_size // num_tokens_per_cluster # how many clusters in a group
         y = torch.zeros_like(q) # (B, n_group, group_size, C)
         for i in range(n_group):
-            qi = q[:, i, :, :].view(B, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs, hs)
+            qi = q[:, i, :, :]#.view(B, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs, hs)
+            q_sinusoidal_pos = self.get_sinusoidal_embeddings(qi.size(1), C).to(device)
+            qi = self.apply_rotary_position_embeddings(q_sinusoidal_pos, qi)
+            qi = qi.view(B, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs, hs)
             num_cluster_tokens = num_clusters_per_group * i # [0, 1, 2, ..., n_group-1] * num_clusters_per_group
             if num_cluster_tokens == 0:
-                ki = k[:, i, :, :].view(B, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs, hs)
+                ki = k[:, i, :, :]#.view(B, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs, hs)
+                k_sinusoidal_pos = self.get_sinusoidal_embeddings(ki.size(1), C).to(device)
+                ki = self.apply_rotary_position_embeddings(k_sinusoidal_pos, ki)
+                ki = ki.view(B, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs, hs)
                 vi = v[:, i, :, :].view(B, self.group_size, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs, hs)
             else:
                 ck_i = ck[:, :num_cluster_tokens, :]
                 cv_i = cv[:, :num_cluster_tokens, :]
-                ki = torch.cat([ck_i, k[:, i, :, :]], dim=1).view(B, self.group_size+num_cluster_tokens, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs+ct, hs)
+                ki = torch.cat([ck_i, k[:, i, :, :]], dim=1)#.view(B, self.group_size+num_cluster_tokens, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs+ct, hs)
+                ki_sinusoidal_pos = self.get_sinusoidal_embeddings(ki.size(1), C).to(device)
+                ki = self.apply_rotary_position_embeddings(ki_sinusoidal_pos, ki)
+                ki = ki.view(B, self.group_size+num_cluster_tokens, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs+ct, hs)
                 vi = torch.cat([cv_i, v[:, i, :, :]], dim=1).view(B, self.group_size+num_cluster_tokens, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, gs+ct, hs)
-            # apply rotary position embeddings
-            q_sinusoidal_pos = self.get_sinusoidal_embeddings(qi.size(2), C // self.n_head).to(device)
-            k_sinusoidal_pos = self.get_sinusoidal_embeddings(ki.size(2), C // self.n_head).to(device)
-            qi_rot = self.apply_rotary_position_embeddings(q_sinusoidal_pos, qi)
-            ki_rot = self.apply_rotary_position_embeddings(k_sinusoidal_pos, ki)
             # create causal mask
             causal_group_mask = torch.ones(self.group_size, self.group_size, dtype=torch.bool, device=device).tril(diagonal=0) # (gs, gs)
             if num_cluster_tokens == 0:
@@ -138,7 +142,7 @@ class CausalSelfAttention(nn.Module):
                 causal_cluster_mask = torch.ones(self.group_size, num_cluster_tokens, dtype=torch.bool, device=device) # (gs, ct)
                 causal_mask = torch.cat([causal_cluster_mask, causal_group_mask], dim=1) # (group_size, group_size+num_cluster_tokens)
             # calculate attention
-            yi = F.scaled_dot_product_attention(qi_rot, ki_rot, vi, attn_mask=causal_mask) # flash attention
+            yi = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=causal_mask) # flash attention
             yi = yi.transpose(1, 2).contiguous().view(B, self.group_size, C) # re-assemble all head outputs side by side
             y[:, i, :, :] = yi
         # step 4: recompose groups into sequence
@@ -450,7 +454,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
-log_dir = "log/lmh_L12D768_CTX1024_C256G256_INTV4_ROPE"
+log_dir = "log/lmh_L12D768_CTX1024_C256G256_INTV4_ROPE2"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
