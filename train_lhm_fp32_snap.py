@@ -97,7 +97,7 @@ class CausalSelfAttention(nn.Module):
                 value = torch.cat([v_past_compress, v_cur], dim=2)
                 # create causal mask
                 causal_group_mask = torch.ones(self.group_size, self.group_size, dtype=torch.bool, device=device).tril(diagonal=0) # (gs, gs)
-                causal_cluster_mask = torch.ones(self.group_size, self.n_cluster, dtype=torch.bool, device=device) # (gs, nc)
+                causal_cluster_mask = torch.ones(self.group_size, k_past_compress.size(2), dtype=torch.bool, device=device) # (gs, nc)
                 causal_mask = torch.cat([causal_cluster_mask, causal_group_mask], dim=1) # (group_size, n_cluster+group_size)
             else:
                 key = k_cur
