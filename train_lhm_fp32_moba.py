@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
-from rwkv_v7_bf16 import Block as RWKVBlock
+from rwkv_v7_fp32 import Block as RWKVBlock
 from moba_efficient import moba_attn_varlen
 # -----------------------------------------------------------------------------
 def hf_to_fa(x: torch.Tensor):
@@ -46,7 +46,7 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.moba_chunk_size = config.moba_chunk_size
         self.moba_topk = config.moba_topk
-        self.window_size = self.moba_chunk_size * self.moba_topk
+        self.window_size = config.moba_chunk_size * config.moba_topk
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -98,7 +98,8 @@ class CausalSelfAttention(nn.Module):
             moba_chunk_size=self.moba_chunk_size,
             moba_topk=self.moba_topk,
         )
-        y = fa_to_hf(y, B)
+        y = fa_to_hf(y, B) #  [batch, heads, seqlen, head_dim]
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # [B, T, C]
         # output projection
         y = self.c_proj(y)
         return y
@@ -128,7 +129,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -140,7 +142,7 @@ class GPTConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
     moba_chunk_size: int = 16 # chunk_size
-    moba_topk: int = 16 # top-k blocks to attend
+    moba_topk: int = 24 # top-k blocks to attend
     chunk_len: int = 16 # don't change
     interval: int = 4 # 1 Transformer block every n blocks
 
@@ -406,7 +408,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
-log_dir = "log/lmh_L12D768_CTX1024_C16G256_INTV4_noPOSAdaptiveAvg"
+log_dir = "log/lmh_L12D768_CTX1024_CS16TOPK24_INTV4"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
@@ -426,7 +428,7 @@ for step in range(max_steps):
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.float32):
                     logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
@@ -464,7 +466,7 @@ for step in range(max_steps):
             mask = mask.to(device)
             # get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.float32):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
@@ -497,7 +499,7 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.float32):
                     logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
@@ -529,7 +531,7 @@ for step in range(max_steps):
         # added after video, this field is also used by the forward pass.
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.float32):
             logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
