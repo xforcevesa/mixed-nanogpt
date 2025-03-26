@@ -1,4 +1,5 @@
 tiktoken
 transformers
 ninja
-flash-attn
+flash-attn==2.6.3
+torch >= 2.1.0
