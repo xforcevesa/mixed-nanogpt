@@ -1,0 +1,4 @@
+tiktoken
+transformers
+ninja
+flash-attn
