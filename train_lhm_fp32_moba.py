@@ -141,10 +141,10 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
-    moba_chunk_size: int = 16 # chunk_size
-    moba_topk: int = 24 # top-k blocks to attend
+    moba_chunk_size: int = 128 # chunk_size
+    moba_topk: int = 3 # top-k blocks to attend
     chunk_len: int = 16 # don't change
-    interval: int = 4 # 1 Transformer block every n blocks
+    interval: int = 12 # 1 Transformer block every n blocks
 
 class GPT(nn.Module):
 
@@ -408,7 +408,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
-log_dir = "log/lmh_L12D768_CTX1024_CS16TOPK24_INTV4"
+log_dir = "log/lmh_L12D768_CTX1024_CS128TOPK3_INTV12"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
